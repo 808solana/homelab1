@@ -125,7 +125,8 @@ check("admin token 200", r.status_code == 200, str(r.status_code))
 aj = r.get_json()
 check("admin has per_customer", isinstance(aj.get("per_customer"), list))
 check("admin has per_upstream_key", isinstance(aj.get("per_upstream_key"), list))
-check("admin per_upstream_key len==5", len(aj["per_upstream_key"]) == 5)
+check("admin per_upstream_key matches pool",
+      len(aj["per_upstream_key"]) == p.NUM_UPSTREAM_KEYS)
 check("admin total_customers==1", aj["total_customers"] == 1, str(aj["total_customers"]))
 
 # 13. Round-robin: generate 6 more keys across 2 customers, verify spread across indexes

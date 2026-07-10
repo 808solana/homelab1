@@ -15,4 +15,8 @@ VOLUME ["/app/data"]
 
 EXPOSE 4000
 # gevent worker + --timeout 0 so long SSE streams are never killed by gunicorn.
-CMD ["gunicorn", "-k", "gevent", "-w", "4", "--timeout", "0", "-b", "0.0.0.0:4000", "proxy:app"]
+# EXACTLY ONE worker (-w 1): the concurrency-slot router keeps per-account
+# in-flight counters in process memory. Multiple workers would each believe
+# they have 3 free slots per account and oversubscribe Neuralwatt's limit.
+# The gevent worker still serves many concurrent requests in that one process.
+CMD ["gunicorn", "-k", "gevent", "-w", "1", "--timeout", "0", "-b", "0.0.0.0:4000", "proxy:app"]

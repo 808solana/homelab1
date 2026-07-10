@@ -22,29 +22,26 @@ services:
       - YOUR_CACHED_INPUT_PRICE_PER_M=${YOUR_CACHED_INPUT_PRICE_PER_M:-0.23}
       - BLENDED_COST_PER_M=${BLENDED_COST_PER_M:-0.10}
       - MAX_KEYS_PER_CUSTOMER=${MAX_KEYS_PER_CUSTOMER:-5}
-      # Cooldown / failover tunables
-      - PROXY_MAX_RETRIES=${PROXY_MAX_RETRIES:-1}
-      - PROXY_MAX_BACKOFF=${PROXY_MAX_BACKOFF:-30}
-      - PROXY_ACCOUNT_COOLDOWN=${PROXY_ACCOUNT_COOLDOWN:-60}
+      # Concurrency-slot router (replaces time-based cooldowns).
+      # Each account carries at most 3 in-flight requests; 429s never
+      # blacklist, they resync the counter and retry within 200-500ms.
+      - PROXY_ACCOUNT_MAX_CONCURRENCY=${PROXY_ACCOUNT_MAX_CONCURRENCY:-3}
       - PROXY_BUDGET_COOLDOWN=${PROXY_BUDGET_COOLDOWN:-300}
+      - PROXY_ERROR_PAUSE=${PROXY_ERROR_PAUSE:-1.0}
+      - PROXY_429_RETRY_WAIT_MIN=${PROXY_429_RETRY_WAIT_MIN:-0.2}
+      - PROXY_429_RETRY_WAIT_MAX=${PROXY_429_RETRY_WAIT_MAX:-0.5}
+      - PROXY_429_SYNC_TTL_MS=${PROXY_429_SYNC_TTL_MS:-1000}
+      - PROXY_INFLIGHT_LOG_INTERVAL=${PROXY_INFLIGHT_LOG_INTERVAL:-5}
       # Streaming heartbeat + stall failover
       - PROXY_HEARTBEAT_INTERVAL=${PROXY_HEARTBEAT_INTERVAL:-5}
       - STREAM_STALL_TIMEOUT_MS=${STREAM_STALL_TIMEOUT_MS:-60000}
       - PROXY_MAX_STREAM_RETRIES=${PROXY_MAX_STREAM_RETRIES:-50}
       - PROXY_CONNECT_TIMEOUT=${PROXY_CONNECT_TIMEOUT:-60}
-      # Overload protection: if first token takes >N ms, demote + instantly rotate
+      # Overload protection: if first token takes >N ms, release the slot and retry elsewhere
       - PROXY_FIRST_TOKEN_TIMEOUT_MS=${PROXY_FIRST_TOKEN_TIMEOUT_MS:-10000}
-      - PROXY_OVERLOAD_COOLDOWN=${PROXY_OVERLOAD_COOLDOWN:-120}
       - PROXY_NONSTREAM_READ_TIMEOUT=${PROXY_NONSTREAM_READ_TIMEOUT:-10}
-      # Queue wait: when all accounts are cooling, hold + heartbeat (not 503). 30=bounded wait, then 503 + Retry-After.
+      # Queue wait: when all accounts are at cap, hold + heartbeat (not 503). >0 = bounded wait, then 503.
       - PROXY_QUEUE_MAX_WAIT=${PROXY_QUEUE_MAX_WAIT:-0}
-      # Upstream routing:
-      #   "active-standby" (N-1 active + 1 standby, default)
-      #   "round-robin"
-      #   "active-reserve" (PROXY_ACTIVE_COUNT active + PROXY_RESERVE_COUNT reserve)
-      - PROXY_UPSTREAM_STRATEGY=${PROXY_UPSTREAM_STRATEGY:-active-standby}
-      - PROXY_ACTIVE_COUNT=${PROXY_ACTIVE_COUNT:-3}
-      - PROXY_RESERVE_COUNT=${PROXY_RESERVE_COUNT:-3}
     volumes:
       # SQLite DB persists across container rebuilds / restarts.
       - ./data:/app/data

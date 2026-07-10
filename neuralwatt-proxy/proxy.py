@@ -7,15 +7,15 @@ it as the `api.luv13.com` product.
 - Accepts requests using luv13-branded model slugs (luv13-*)
 - Rewrites model names to Neuralwatt's actual model IDs
 - Authenticates customers via hashed `sk-luv13-...` API keys (multi-tenant)
-- Routes across a ring of NAMED upstream Neuralwatt accounts using an
-  active-standby strategy: N-1 keys actively serve traffic while 1 rests in
-  reserve. On a 429 rate-limit or 401/402/403 budget error the failing key is
-  demoted to standby (cooled + parked), and the previously-resting key rejoins
-  the active pool on the next request. Rate-limited accounts go into a
-  cooldown (circuit breaker) and are skipped until they recover. (A
-  `round-robin` strategy and a configurable `active-reserve` strategy are also
-  available.) Whichever account serves, the response always returns to the
-  original customer.
+- Routes across a pool of NAMED upstream Neuralwatt accounts using real-time
+  concurrency tracking: each account has a hard cap of 3 in-flight requests
+  (Neuralwatt's measured concurrency limit). The router dispatches to the
+  least-loaded account with a free slot; if every account is at cap the
+  request queues and goes to the first account that frees a slot. A 429 is
+  treated as "slots full" (a race), never as a penalty — the request retries
+  on another free slot within ~200-500ms. Only genuine auth/budget errors
+  (401/402/403) park an account for a longer period. Whichever account
+  serves, the response always returns to the original customer.
 - Tracks usage (input / output / cached tokens, cost, revenue) in SQLite, including
   which account ACTUALLY served each request (served_upstream_index)
 - Exposes customer usage at GET /usage (branded-key auth)
@@ -104,40 +104,55 @@ def account_name(idx: int) -> str:
     return ACCOUNT_NAMES.get(idx, f"account-{idx}")
 
 
-# ── RING FAILOVER + COOLDOWN (circuit breaker) ───────────────────────────────
-# Under active-standby (default), N-1 keys actively serve while 1 rests as
-# standby; the ring order puts active keys first and the standby last (see
-# _active_standby_order / ring_order). On a 429/401/402/403 the failing key is
-# demoted to standby (cooled + parked); the previously-resting key rejoins
-# active on the next request. Under active-reserve, a configurable number of
-# keys serve actively while the rest rest in reserve; failures demote an active
-# key to cooldown and promote the next reserve into active. Under round-robin,
-# the starting account rotates across requests and failover cascades around the
-# ring from there. In all cases a rate-limited account is put into cooldown and
-# skipped until it recovers, so it gets a rest while the ring carries traffic. The
-# api_keys.upstream_key_index column is retained for round-robin's initial
-# offset and admin reporting, but under active-standby it is not a "home
-# account" — that column is ignored for ring ordering.
+# ── CONCURRENCY-SLOT ROUTER (replaces time-based cooldowns) ──────────────────
+# Measured NeuralWatt behavior (confirmed by direct probing):
+#   * Each account allows exactly 3 concurrent in-flight requests.
+#   * A 429 means "3/3 slots in use" RIGHT NOW — not a penalty period. The
+#     server accepts a new request the moment an in-flight request finishes
+#     (measured clear-after-idle ~0.001s). There is NO server-side cooldown.
+#   * The Retry-After header is always "1" and carries no timing signal — it
+#     is deliberately ignored.
+# So instead of blacklisting an account for a fixed duration after a 429, the
+# proxy tracks in-flight requests per account in real time and only dispatches
+# to an account with a free slot (< MAX_CONCURRENCY_PER_ACCOUNT in flight).
+# If every account is at cap, the request queues and dispatches to the FIRST
+# account that frees a slot.
 #
-# NOTE: cooldown state is in-process memory (fine under `app.run(threaded=True)`).
-# If this is ever run under gunicorn with multiple workers, each worker keeps its
-# own view — move cooldowns to SQLite/Redis before doing that.
-MAX_RETRIES = int(os.getenv("PROXY_MAX_RETRIES", "5"))
-MAX_BACKOFF = float(os.getenv("PROXY_MAX_BACKOFF", "30"))          # seconds cap
-ACCOUNT_COOLDOWN = float(os.getenv("PROXY_ACCOUNT_COOLDOWN", "3"))   # after a 429/5xx
+# A 429 can still slip through (a slot the server hasn't released yet, or a
+# competing consumer of the same account). When it does: log it, resync the
+# local counter (phantom slots that expire after PHANTOM_SLOT_TTL), and retry
+# on any account with a free slot after a short 200-500ms jitter. Never
+# blacklist.
+#
+# Only genuine auth/budget errors (401/402/403) park an account, for
+# BUDGET_COOLDOWN seconds. Transient 5xx/connection errors pause an account
+# for ERROR_PAUSE (~1s) purely to avoid hammering a broken host in a tight
+# loop — near-zero, not a cooldown.
+#
+# NOTE: slot state is in-process memory. The proxy MUST run as a single
+# process (gunicorn -w 1; the gevent worker handles concurrency). Multiple
+# workers would each think they have 3 slots per account and oversubscribe.
+MAX_CONCURRENCY_PER_ACCOUNT = int(os.getenv("PROXY_ACCOUNT_MAX_CONCURRENCY", "3"))
 BUDGET_COOLDOWN = float(os.getenv("PROXY_BUDGET_COOLDOWN", "300"))   # after auth/budget err
-RETRY_STATUSES = {429, 500, 502, 503, 504}   # rate-limited/transient -> cooldown + failover
-BUDGET_STATUSES = {401, 402, 403}            # auth/budget exhausted -> long cooldown + failover
+ERROR_PAUSE = float(os.getenv("PROXY_ERROR_PAUSE", "1.0"))  # 5xx/conn hiccup breather
+RETRY_429_WAIT_MIN = float(os.getenv("PROXY_429_RETRY_WAIT_MIN", "0.2"))
+RETRY_429_WAIT_MAX = float(os.getenv("PROXY_429_RETRY_WAIT_MAX", "0.5"))
+# How long a phantom slot (counter-resync after an unexpected 429) lives.
+PHANTOM_SLOT_TTL = float(os.getenv("PROXY_429_SYNC_TTL_MS", "1000")) / 1000.0
+# Give up and forward the 429 to the client after this many surprise 429
+# retries on one request (safety valve — should never trigger in practice).
+MAX_429_RETRIES = int(os.getenv("PROXY_MAX_429_RETRIES", "40"))
+RETRY_STATUSES = {429, 500, 502, 503, 504}   # retryable -> failover to another slot
+BUDGET_STATUSES = {401, 402, 403}            # auth/budget exhausted -> park account
+# How often the background sampler logs per-account in-flight counts.
+INFLIGHT_LOG_INTERVAL = float(os.getenv("PROXY_INFLIGHT_LOG_INTERVAL", "5"))
 
-# Queue wait: when ALL upstream accounts are in cooldown, the proxy waits for
-# one to recover instead of failing fast with 503. 0 = wait indefinitely (the
-# proxy stays open, sending SSE heartbeats for streaming, until an account is
-# available). Any positive value = max seconds to wait before giving up and
-# returning 503 + Retry-After (the seconds until the soonest account recovers).
-# Default 0 — wait indefinitely. Reasoning models can sit in queue for longer
-# than 30s while all four accounts cool down; bounded waits were 503ing them
-# mid-thought. Set PROXY_QUEUE_MAX_WAIT > 0 to re-enable bounded 503 behavior.
-QUEUE_MAX_WAIT = float(os.getenv("PROXY_QUEUE_MAX_WAIT", "0"))    # 0 = unlimited (wait until account recovers); >0 = bounded wait then 503 + Retry-After
+# Queue wait: when ALL accounts are at their concurrency cap, the proxy waits
+# for a slot to free instead of failing fast with 503. 0 = wait indefinitely
+# (the proxy stays open, sending SSE heartbeats for streaming, until a slot
+# frees). Any positive value = max seconds to wait before giving up and
+# returning 503.
+QUEUE_MAX_WAIT = float(os.getenv("PROXY_QUEUE_MAX_WAIT", "0"))    # 0 = unlimited
 
 # ── STREAMING HEARTBEAT + STALL FAILOVER ─────────────────────────────────────
 # Heartbeat: send SSE comment lines (": keepalive\n\n") every N seconds before the
@@ -146,8 +161,8 @@ QUEUE_MAX_WAIT = float(os.getenv("PROXY_QUEUE_MAX_WAIT", "0"))    # 0 = unlimite
 HEARTBEAT_INTERVAL = float(os.getenv("PROXY_HEARTBEAT_INTERVAL", "5"))  # seconds
 
 # Stall: if no SSE chunks arrive for N seconds *during* a stream (after the first
-# token), the upstream is considered stalled. The connection is closed, the
-# account is cooled, and the request is retried on the next account in the ring.
+# token), the upstream is considered stalled. The connection is closed, the slot
+# is released, and the request is retried on another account with a free slot.
 #
 # `STREAM_STALL_TIMEOUT_MS` mirrors the deployment tool used for the queue-wait
 # change at PROXY_QUEUE_MAX_WAIT: a *_MS env var with a safe integer parser so
@@ -199,7 +214,7 @@ def _parse_stall_timeout_ms() -> float:
 
 
 STREAM_STALL_TIMEOUT = _parse_stall_timeout_ms()   # seconds
-MAX_STREAM_RETRIES = int(os.getenv("PROXY_MAX_STREAM_RETRIES", "50"))        # mid-stream retries — high so a saturated ring grinds through cooldowns rather than 503ing the client
+MAX_STREAM_RETRIES = int(os.getenv("PROXY_MAX_STREAM_RETRIES", "50"))        # mid-stream retries — high so a saturated pool grinds through transient errors rather than 503ing the client
 
 # Overload protection: if an active upstream key takes longer than this to emit
 # its FIRST token (TTFB), it is treated as overloaded — instantly demoted
@@ -224,7 +239,6 @@ def _parse_first_token_timeout_ms() -> float:
     return ms / 1000.0
 
 FIRST_TOKEN_TIMEOUT = _parse_first_token_timeout_ms()
-OVERLOAD_COOLDOWN = float(os.getenv("PROXY_OVERLOAD_COOLDOWN", "120"))  # 2 min rest after overload
 # Non-streaming requests get a read timeout so an overloaded upstream can't
 # hang the request forever. Streaming uses FIRST_TOKEN_TIMEOUT + stall detection
 # instead (None read timeout so long generations aren't cut off mid-stream).
@@ -234,68 +248,264 @@ NONSTREAM_READ_TIMEOUT = float(os.getenv(
 ))
 UPSTREAM_TIMEOUT_NONSTREAM = (CONNECT_TIMEOUT, NONSTREAM_READ_TIMEOUT)
 
-_cooldowns = {}                 # 1-based upstream idx -> epoch time it's cooling until
-_cooldown_lock = threading.Lock()
+# ── IN-FLIGHT SLOT STATE ─────────────────────────────────────────────────────
+# All slot state lives under one lock + condition. `_inflight[idx]` counts OUR
+# live requests on that account. `_phantom_slots[idx]` holds expiry epochs for
+# slots the server evidently still considers occupied even though our counter
+# said free (detected via an unexpected 429) — each phantom blocks one slot
+# until it expires (PHANTOM_SLOT_TTL). `_parked_until[idx]` sidelines an
+# account after a genuine auth/budget error; `_paused_until[idx]` is a
+# sub-second breather after a 5xx/connection error.
+_slot_lock = threading.Lock()
+_slot_freed = threading.Condition(_slot_lock)
+_inflight = {i: 0 for i in range(1, NUM_UPSTREAM_KEYS + 1)}
+_phantom_slots = {i: [] for i in range(1, NUM_UPSTREAM_KEYS + 1)}
+_parked_until = {i: 0.0 for i in range(1, NUM_UPSTREAM_KEYS + 1)}
+_paused_until = {i: 0.0 for i in range(1, NUM_UPSTREAM_KEYS + 1)}
+_queue_waiting = 0              # requests currently blocked waiting for any slot
+
+# Rolling counters for the sampler log + /admin/inflight (guarded by _slot_lock).
+_slot_stats = {
+    "dispatches": 0,
+    "unexpected_429s": 0,
+    "queue_waits": 0,
+    "queue_wait_total_s": 0.0,
+    "queue_wait_max_s": 0.0,
+    "peak_inflight": {i: 0 for i in range(1, NUM_UPSTREAM_KEYS + 1)},
+}
+
+log.info("router: concurrency-slots (%d accounts x %d slots = %d max in-flight)",
+         NUM_UPSTREAM_KEYS, MAX_CONCURRENCY_PER_ACCOUNT,
+         NUM_UPSTREAM_KEYS * MAX_CONCURRENCY_PER_ACCOUNT)
 
 
-# ── UPSTREAM ROUTING STRATEGY ───────────────────────────────────────────────
-# "active-standby" (default): N-1 keys actively serve traffic while 1 rests as
-#   standby. On a 429/401/402/403 the failing key is demoted to standby (cooled
-#   + parked); the previously-resting key rejoins active on the next request.
-#   5xx / connection errors / mid-stream stalls still cool the key (existing
-#   behavior) but do NOT rotate the standby. The `api_keys.upstream_key_index`
-#   column is retained for round-robin's initial offset and admin reporting but
-#   is no longer treated as a "home account" under this strategy.
-# "round-robin": rotate the starting account across all requests so concurrent
-#   sessions spread evenly across the pool. Failover still cascades around the
-#   ring from whichever account was picked first.
-# "active-reserve": a configurable number of keys actively serve traffic
-#   (PROXY_ACTIVE_COUNT, default 3) while the rest rest in reserve
-#   (PROXY_RESERVE_COUNT, default 3). Active keys are shared evenly via a
-#   per-position counter (not a naive global counter). When an active key is
-#   rate-limited or hits an auth/budget error it is demoted to cooldown (red);
-#   after cooling it joins the reserve pool. The next reserve key rotates into
-#   active to replace it.
-UPSTREAM_STRATEGY = os.getenv("PROXY_UPSTREAM_STRATEGY", "active-standby").lower()
-ACTIVE_RESERVE_ACTIVE_COUNT = int(os.getenv("PROXY_ACTIVE_COUNT", "3"))
-ACTIVE_RESERVE_RESERVE_COUNT = int(os.getenv("PROXY_RESERVE_COUNT", "3"))
-if ACTIVE_RESERVE_ACTIVE_COUNT + ACTIVE_RESERVE_RESERVE_COUNT > NUM_UPSTREAM_KEYS:
-    raise ValueError(
-        f"PROXY_ACTIVE_COUNT ({ACTIVE_RESERVE_ACTIVE_COUNT}) + "
-        f"PROXY_RESERVE_COUNT ({ACTIVE_RESERVE_RESERVE_COUNT}) = "
-        f"{ACTIVE_RESERVE_ACTIVE_COUNT + ACTIVE_RESERVE_RESERVE_COUNT}, "
-        f"which exceeds NUM_UPSTREAM_KEYS ({NUM_UPSTREAM_KEYS})"
-    )
-if ACTIVE_RESERVE_ACTIVE_COUNT < 1:
-    raise ValueError("PROXY_ACTIVE_COUNT must be at least 1")
-_round_robin_counter = 0
-_round_robin_lock = threading.Lock()
-
-log.info("strategy: %s", UPSTREAM_STRATEGY)
-if UPSTREAM_STRATEGY == "active-reserve":
-    log.info("active-reserve pool: %d active, %d reserve",
-              ACTIVE_RESERVE_ACTIVE_COUNT, ACTIVE_RESERVE_RESERVE_COUNT)
+def _prune_phantoms_locked(idx: int, now: float) -> int:
+    """Drop expired phantom slots for idx; return the live phantom count."""
+    live = [t for t in _phantom_slots[idx] if t > now]
+    _phantom_slots[idx] = live
+    return len(live)
 
 
-def _next_round_robin_idx() -> int:
-    """Atomically increment and return the next 1-based upstream index."""
-    global _round_robin_counter
-    with _round_robin_lock:
-        idx = ((_round_robin_counter % NUM_UPSTREAM_KEYS) + 1)
-        _round_robin_counter += 1
-        return idx
+def _effective_inflight_locked(idx: int, now: float) -> int:
+    return _inflight[idx] + _prune_phantoms_locked(idx, now)
 
 
-def _cooldown_remaining(idx: int) -> float:
-    with _cooldown_lock:
-        return max(0.0, _cooldowns.get(idx, 0.0) - time.time())
+def _slot_available_locked(idx: int, now: float) -> bool:
+    return (bool(UPSTREAM_KEYS[idx - 1])
+            and _parked_until[idx] <= now
+            and _paused_until[idx] <= now
+            and _effective_inflight_locked(idx, now) < MAX_CONCURRENCY_PER_ACCOUNT)
 
 
-# In-memory log of cooldown START timestamps per account, so recovery can be
-# emitted as an event when _cooldown_remaining crosses zero (lazy detection in
-# _admin_summary_data). Keyed by 1-based upstream idx.
-_cooldown_started_at = {}                 # idx -> epoch when cooldown was set
-_cooldown_started_lock = threading.Lock()
+def _try_acquire_slot_locked(now: float) -> int:
+    """Pick the least-loaded account with a free slot (ties -> lowest idx).
+    Increments its in-flight counter and returns the idx, or 0 if every
+    account is at cap / parked."""
+    best, best_load = 0, None
+    for i in range(1, NUM_UPSTREAM_KEYS + 1):
+        if not _slot_available_locked(i, now):
+            continue
+        load = _effective_inflight_locked(i, now)
+        if best_load is None or load < best_load:
+            best, best_load = i, load
+    if best:
+        _inflight[best] += 1
+        _slot_stats["dispatches"] += 1
+        if _inflight[best] > _slot_stats["peak_inflight"][best]:
+            _slot_stats["peak_inflight"][best] = _inflight[best]
+    return best
+
+
+def try_acquire_slot() -> int:
+    """Non-blocking: acquire a slot on the least-loaded free account, or 0."""
+    with _slot_lock:
+        return _try_acquire_slot_locked(time.time())
+
+
+def wait_for_slot(timeout: float) -> None:
+    """Block up to `timeout` seconds for any slot-freed notification. Used by
+    the streaming generator between try_acquire_slot() attempts so it can
+    yield heartbeats while queued."""
+    global _queue_waiting
+    with _slot_freed:
+        _queue_waiting += 1
+        try:
+            _slot_freed.wait(timeout)
+        finally:
+            _queue_waiting -= 1
+
+
+def acquire_slot(max_wait: float | None) -> int:
+    """Blocking acquire for the non-streaming path. Waits until a slot frees
+    (first account to free a slot wins). max_wait=None waits forever;
+    otherwise gives up after max_wait seconds and returns 0."""
+    global _queue_waiting
+    start = time.time()
+    deadline = None if max_wait is None else start + max_wait
+    with _slot_freed:
+        idx = _try_acquire_slot_locked(start)
+        if idx:
+            return idx
+        _queue_waiting += 1
+        try:
+            while True:
+                now = time.time()
+                if deadline is not None and now >= deadline:
+                    return 0
+                # Short slices so pause/park/phantom expiry is noticed even
+                # without a notify.
+                remaining = None if deadline is None else deadline - now
+                slice_s = 0.25 if remaining is None else min(0.25, remaining)
+                _slot_freed.wait(slice_s)
+                idx = _try_acquire_slot_locked(time.time())
+                if idx:
+                    _note_queue_wait_locked(time.time() - start)
+                    return idx
+        finally:
+            _queue_waiting -= 1
+
+
+def release_slot(idx: int) -> None:
+    """Decrement idx's in-flight counter (request finished — success OR
+    failure) and wake anyone queued for a slot."""
+    with _slot_freed:
+        if _inflight[idx] > 0:
+            _inflight[idx] -= 1
+        else:  # defensive: never let the counter go negative / drift
+            log.error("release_slot(%d) with counter already 0 — counter drift?", idx)
+        _slot_freed.notify_all()
+
+
+def _note_queue_wait_locked(waited_s: float) -> None:
+    _slot_stats["queue_waits"] += 1
+    _slot_stats["queue_wait_total_s"] += waited_s
+    if waited_s > _slot_stats["queue_wait_max_s"]:
+        _slot_stats["queue_wait_max_s"] = waited_s
+
+
+def note_queue_wait(waited_s: float) -> None:
+    with _slot_lock:
+        _note_queue_wait_locked(waited_s)
+
+
+def note_unexpected_429(idx: int) -> None:
+    """A 429 slipped through even though our counter said a slot was free —
+    either the server hadn't released a just-finished request yet, or someone
+    else is using this account. Resync: add phantom slots so our effective
+    count reads 3/3 for PHANTOM_SLOT_TTL. Do NOT blacklist."""
+    with _slot_lock:
+        now = time.time()
+        _slot_stats["unexpected_429s"] += 1
+        # The caller still holds its local slot on idx, but the server
+        # REJECTED that request — it occupies no server slot. So once the
+        # caller releases, the account should read exactly full (3/3):
+        # phantoms needed = cap - (effective - 1).
+        deficit = (MAX_CONCURRENCY_PER_ACCOUNT
+                   - _effective_inflight_locked(idx, now) + 1)
+        for _ in range(max(deficit, 1)):
+            _phantom_slots[idx].append(now + PHANTOM_SLOT_TTL)
+    record_event(idx, "error_429", http_status=429,
+                 message="unexpected 429 (slots full server-side); "
+                         f"counter resynced for {PHANTOM_SLOT_TTL * 1000:.0f}ms, no blacklist")
+
+
+def park_account(idx: int, seconds: float, *, reason: str,
+                 http_status: int | None = None) -> None:
+    """Sideline an account after a genuine auth/budget error (401/402/403).
+    This is the ONLY long-duration removal left — never used for 429s."""
+    with _slot_lock:
+        _parked_until[idx] = max(_parked_until[idx], time.time() + seconds)
+    ev_type = ("error_budget" if http_status in BUDGET_STATUSES else "park_start")
+    record_event(idx, ev_type, http_status=http_status,
+                 message=f"{reason}; parked {seconds:.0f}s")
+
+
+def pause_account(idx: int, seconds: float, *, reason: str,
+                  http_status: int | None = None,
+                  event_type: str | None = None) -> None:
+    """Give an account a sub-second/short breather after a 5xx or connection
+    error so a broken host isn't hammered in a tight loop. Not a cooldown."""
+    with _slot_lock:
+        _paused_until[idx] = max(_paused_until[idx], time.time() + seconds)
+    if event_type is None:
+        event_type = "error_5xx" if http_status else "error_conn"
+    record_event(idx, event_type, http_status=http_status,
+                 message=f"{reason}; paused {seconds:.1f}s")
+
+
+def _park_remaining(idx: int) -> float:
+    with _slot_lock:
+        return max(0.0, _parked_until[idx] - time.time())
+
+
+def inflight_snapshot() -> dict:
+    """Point-in-time view of slot state for logs + /admin/inflight."""
+    with _slot_lock:
+        now = time.time()
+        accounts = []
+        for i in range(1, NUM_UPSTREAM_KEYS + 1):
+            phantoms = _prune_phantoms_locked(i, now)
+            accounts.append({
+                "upstream_key_index": i,
+                "account_name": account_name(i),
+                "in_flight": _inflight[i],
+                "phantom_slots": phantoms,
+                "max_concurrency": MAX_CONCURRENCY_PER_ACCOUNT,
+                "free_slots": max(
+                    0, MAX_CONCURRENCY_PER_ACCOUNT - _inflight[i] - phantoms),
+                "parked_s": round(max(0.0, _parked_until[i] - now), 1),
+                "paused_s": round(max(0.0, _paused_until[i] - now), 2),
+                "peak_in_flight": _slot_stats["peak_inflight"][i],
+            })
+        waits = _slot_stats["queue_waits"]
+        return {
+            "timestamp": now,
+            "accounts": accounts,
+            "total_in_flight": sum(_inflight.values()),
+            "queue_waiting": _queue_waiting,
+            "available_accounts": sum(
+                1 for i in range(1, NUM_UPSTREAM_KEYS + 1)
+                if _slot_available_locked(i, now)),
+            "stats": {
+                "dispatches": _slot_stats["dispatches"],
+                "unexpected_429s": _slot_stats["unexpected_429s"],
+                "queue_waits": waits,
+                "queue_wait_avg_s": round(
+                    _slot_stats["queue_wait_total_s"] / waits, 3) if waits else 0.0,
+                "queue_wait_max_s": round(_slot_stats["queue_wait_max_s"], 3),
+            },
+        }
+
+
+def _inflight_sampler() -> None:
+    """Background thread: log per-account in-flight counts every
+    INFLIGHT_LOG_INTERVAL seconds (only while there's activity), so we can
+    verify slots never exceed 3 and queue waits stay low."""
+    was_active = False
+    while True:
+        time.sleep(INFLIGHT_LOG_INTERVAL)
+        try:
+            snap = inflight_snapshot()
+            active = snap["total_in_flight"] > 0 or snap["queue_waiting"] > 0
+            if not active and not was_active:
+                continue  # stay quiet while idle
+            was_active = active
+            per_acct = " ".join(
+                f"{a['account_name']}={a['in_flight']}/{a['max_concurrency']}"
+                + (f"+{a['phantom_slots']}ph" if a["phantom_slots"] else "")
+                for a in snap["accounts"])
+            s = snap["stats"]
+            log.info("inflight %s | total=%d queued=%d avail_accts=%d | "
+                     "429s=%d qwaits=%d avg=%.2fs max=%.2fs",
+                     per_acct, snap["total_in_flight"], snap["queue_waiting"],
+                     snap["available_accounts"], s["unexpected_429s"],
+                     s["queue_waits"], s["queue_wait_avg_s"], s["queue_wait_max_s"])
+        except Exception:
+            log.exception("inflight sampler tick failed")
+
+
+threading.Thread(target=_inflight_sampler, daemon=True,
+                 name="inflight-sampler").start()
 
 
 def record_event(upstream_key_index, event_type: str, *,
@@ -303,9 +513,9 @@ def record_event(upstream_key_index, event_type: str, *,
     """Persist an event row. Safe from any thread — opens its own short-lived
     SQLite connection so it can't collide with the per-request `g.db`.
 
-    event_type is one of: cooldown_start, cooldown_recover, error_429,
-    error_budget, error_5xx, error_conn, error_stall, error_overload,
-    error_timeout, queue_wait, info.
+    event_type is one of: error_429 (unexpected 429, counter resync — NOT a
+    blacklist), error_budget, park_start, error_5xx, error_conn, error_stall,
+    error_overload, error_timeout, queue_wait, info.
     """
     try:
         name = account_name(upstream_key_index) if upstream_key_index else None
@@ -334,313 +544,93 @@ def record_event(upstream_key_index, event_type: str, *,
         log.warning("record_event failed: %s", e)
 
 
-def _set_cooldown(idx: int, seconds: float, *,
-                  reason: str | None = None, http_status: int | None = None) -> None:
-    """Set (or extend) a cooldown for upstream account idx. Persists a
-    cooldown_start event so the admin dashboard can show cooldown timestamps
-    and the test harness can correlate 429 timing."""
-    with _cooldown_lock:
-        _cooldowns[idx] = max(_cooldowns.get(idx, 0.0), time.time() + seconds)
-    with _cooldown_started_lock:
-        _cooldown_started_at[idx] = time.time()
-    ev_type = "cooldown_start"
-    msg = reason or f"cooling {seconds:.1f}s"
-    if http_status:
-        ev_type = f"error_{http_status}" if http_status in (429, 401, 402, 403) else ev_type
-    record_event(idx, ev_type, http_status=http_status, message=msg)
+def post_upstream(body):
+    """Send a NON-STREAMING request to Neuralwatt. Returns
+    (response_or_None, used_idx).
 
+    Acquires a concurrency slot on the least-loaded account (queueing until
+    one frees if all 8 accounts are at 3/3), sends the request, and releases
+    the slot when the response has been fully read — success OR failure.
 
-# ── ACTIVE-STANDBY + ACTIVE-RESERVE POOLS ───────────────────────────────────
-# active-standby: one upstream key rests as STANDBY while the others actively
-#   serve. On a 429/401/402/403 the failing key is demoted to standby (cooled).
-#   5xx/connection errors/mid-stream stalls cool the key but do NOT rotate the
-#   standby.
-# active-reserve: configurable active/reserve split. Active keys serve traffic
-#   and are shared evenly via a per-position counter (not a naive global
-#   counter). Reserve keys rest. When an active key is demoted it is cooled; the
-#   next reserve key in the ring rotates into active. After cooldown the demoted
-#   key becomes a reserve.
-#
-# In-process state: each gunicorn worker keeps its own view. All workers
-# bootstrap to the same default pools, so they tend to agree. See the cooldown
-# caveat above.
-_STANDBY_IDX = NUM_UPSTREAM_KEYS  # 1-based idx of resting key; key N rests at boot
-_POOL_LOCK = threading.Lock()     # guards standby / active-reserve swaps
-
-# active-reserve state
-_ACTIVE_RESERVE_SLOTS = {
-    "active": set(range(1, ACTIVE_RESERVE_ACTIVE_COUNT + 1)),      # 1-based
-    "reserve": set(range(
-        ACTIVE_RESERVE_ACTIVE_COUNT + 1,
-        ACTIVE_RESERVE_ACTIVE_COUNT + ACTIVE_RESERVE_RESERVE_COUNT + 1,
-    )),
-}
-# Counter for perfectly even rotation among active keys. The counter stores the
-# index into the sorted active list at which the next request will start; after
-# each request it advances by one and wraps, so every active key gets exactly
-# 1/N of requests.
-_ACTIVE_RESERVE_COUNTER = 0
-_ACTIVE_RESERVE_COUNTER_LOCK = threading.Lock()
-
-
-def _active_standby_order() -> list:
-    """1-based indices, active keys first (standby excluded), standby last as a
-    last-resort fallback. If no standby is set, returns plain 1..N order.
+    Error handling (no time-based cooldowns):
+      - unexpected 429  -> resync counter (phantom slots), retry on any free
+                           slot after a 200-500ms jitter; never blacklist
+      - 5xx/conn error  -> ~1s breather for that account, retry elsewhere
+      - 401/402/403     -> park the account for BUDGET_COOLDOWN (real budget
+                           problem, not a rate limit)
     """
-    with _POOL_LOCK:
-        standby = _STANDBY_IDX
-    order = [i for i in range(1, NUM_UPSTREAM_KEYS + 1) if i != standby]
-    if standby is not None:
-        order.append(standby)
-    return order
-
-
-def _demote_to_standby(idx: int, cooldown_s: float, *,
-                       reason: str | None = None,
-                       http_status: int | None = None) -> None:
-    """429/403 received under active-standby: cool the key and make it the new
-    standby. The previously-resting key automatically rejoins active on the next
-    request."""
-    global _STANDBY_IDX
-    _set_cooldown(idx, cooldown_s, reason=reason, http_status=http_status)
-    with _POOL_LOCK:
-        _STANDBY_IDX = idx
-
-
-def _active_reserve_state() -> tuple:
-    """Return (active, reserve) sets of 1-based indices under _POOL_LOCK.
-
-    If cooldown expired for demoted keys, move them back into reserve if there
-    is room, restoring the configured reserve size.
-    """
-    with _POOL_LOCK:
-        global _ACTIVE_RESERVE_SLOTS
-        active = set(_ACTIVE_RESERVE_SLOTS["active"])
-        reserve = set(_ACTIVE_RESERVE_SLOTS["reserve"])
-        cooling = set(range(1, NUM_UPSTREAM_KEYS + 1)) - active - reserve
-        now = time.time()
-        recovered = {i for i in cooling if _cooldowns.get(i, 0) <= now}
-        if recovered:
-            for i in sorted(recovered):
-                if len(reserve) < ACTIVE_RESERVE_RESERVE_COUNT:
-                    reserve.add(i)
-                else:
-                    active.add(i)
-            # If active dipped below configured, top it off from reserve.
-            while len(active) < ACTIVE_RESERVE_ACTIVE_COUNT and reserve:
-                next_reserve = min(reserve)
-                reserve.remove(next_reserve)
-                active.add(next_reserve)
-            _ACTIVE_RESERVE_SLOTS = {"active": active, "reserve": reserve}
-        return active, reserve
-
-
-def _active_reserve_order() -> list:
-    """Order: active keys (rotated evenly), then reserve, then any others."""
-    active, reserve = _active_reserve_state()
-    active_sorted = sorted(active)
-    with _ACTIVE_RESERVE_COUNTER_LOCK:
-        global _ACTIVE_RESERVE_COUNTER
-        if active_sorted:
-            start = _ACTIVE_RESERVE_COUNTER % len(active_sorted)
-            _ACTIVE_RESERVE_COUNTER += 1
-            active_order = active_sorted[start:] + active_sorted[:start]
-        else:
-            active_order = []
-    reserve_order = sorted(reserve)
-    others = [i for i in range(1, NUM_UPSTREAM_KEYS + 1)
-              if i not in active and i not in reserve]
-    return active_order + reserve_order + others
-
-
-def _active_reserve_demote(idx: int, cooldown_s: float, *,
-                           reason: str | None = None,
-                           http_status: int | None = None) -> None:
-    """Demote active key idx: cooldown, then promote next reserve to active."""
-    global _ACTIVE_RESERVE_SLOTS
-    _set_cooldown(idx, cooldown_s, reason=reason, http_status=http_status)
-    with _POOL_LOCK:
-        slots = {"active": set(_ACTIVE_RESERVE_SLOTS["active"]),
-                 "reserve": set(_ACTIVE_RESERVE_SLOTS["reserve"])}
-        slots["active"].discard(idx)
-        available_reserve = sorted(r for r in slots["reserve"]
-                                    if _cooldown_remaining(r) <= 0)
-        if available_reserve:
-            replacement = available_reserve[0]
-            slots["reserve"].remove(replacement)
-            slots["active"].add(replacement)
-        # Recovered cooling keys may refill reserve.
-        now = time.time()
-        cooling = (set(range(1, NUM_UPSTREAM_KEYS + 1))
-                   - slots["active"] - slots["reserve"])
-        recovered = sorted(i for i in cooling if _cooldowns.get(i, 0) <= now)
-        for i in recovered:
-            if len(slots["reserve"]) < ACTIVE_RESERVE_RESERVE_COUNT:
-                slots["reserve"].add(i)
-        _ACTIVE_RESERVE_SLOTS = slots
-
-
-def _retry_delay(resp) -> float:
-    """Seconds to cool an account: prefer the server's Retry-After, else backoff."""
-    if resp is not None:
-        ra = resp.headers.get("Retry-After")
-        if ra:
-            try:
-                return min(float(ra), MAX_BACKOFF)
-            except ValueError:
-                pass
-    return min(2.0 + random.random(), MAX_BACKOFF)
-
-
-def _wait_for_available_account(order, heartbeat_cb=None) -> int:
-    """Wait for an account in `order` to come off cooldown and return its idx.
-
-    Called when all accounts are cooling — prevents a 503 by queueing the
-    request until an account recovers. Waits indefinitely if QUEUE_MAX_WAIT=0,
-    otherwise waits up to QUEUE_MAX_WAIT seconds.
-
-    `heartbeat_cb()` is called periodically while waiting (for streaming, it
-    sends SSE keepalive comments so NPM/Cloudflare/Cursor don't time out).
-    Returns the 1-based idx of the first available account, or 0 if the wait
-    was exhausted.
-    """
-    deadline = None if QUEUE_MAX_WAIT <= 0 else time.time() + QUEUE_MAX_WAIT
-    poll_interval = min(HEARTBEAT_INTERVAL, 5.0)
-    while True:
-        # Check for any available account
-        for idx in order:
-            if _cooldown_remaining(idx) <= 0 and UPSTREAM_KEYS[idx - 1]:
-                return idx
-        # All in cooldown — wait and heartbeat
-        if deadline is not None and time.time() >= deadline:
-            return 0
-        if heartbeat_cb is not None:
-            heartbeat_cb()
-        # Sleep in small slices so the heartbeat fires regularly
-        soonest = min((_cooldown_remaining(i) for i in order), default=poll_interval)
-        time.sleep(min(soonest, poll_interval))
-
-
-def ring_order(primary_idx: int) -> list:
-    """1-based indices to try, in the order they should be attempted.
-
-    - active-standby (default): N-1 keys actively serve while 1 rests as
-      standby. Active keys come first (in ascending order), the standby is
-      appended last as a last-resort fallback. On a 429/401/402/403 the
-      failing key is demoted to standby (see _demote_to_standby); the
-      previously-resting key rejoining active is just the natural consequence
-      of it no longer being the standby. `primary_idx` is ignored under this
-      strategy.
-    - active-reserve: PROXY_ACTIVE_COUNT keys actively serve while
-      PROXY_RESERVE_COUNT keys rest in reserve. Active keys are rotated evenly
-      so each gets exactly 1/N of traffic. On failure an active key is demoted
-      to cooldown and the next reserve key is promoted into active. After
-      cooldown the demoted key becomes a reserve.
-    - round-robin: rotate the starting point across all requests, spreading
-      load evenly. Failover still cascades from there. Also the implicit
-      fallback for any unrecognized strategy value.
-    """
-    n = NUM_UPSTREAM_KEYS
-    if UPSTREAM_STRATEGY == "active-standby":
-        return _active_standby_order()
-    if UPSTREAM_STRATEGY == "active-reserve":
-        return _active_reserve_order()
-    # round-robin (safe fallthrough default for unrecognized strategy values)
-    start = _next_round_robin_idx()
-    order = [start]
-    i = start
-    for _ in range(n - 1):
-        i = i % n + 1
-        order.append(i)
-    return order
-
-
-def post_upstream(order, body, stream):
-    """Send to Neuralwatt across the ring. Returns (response_or_None, used_idx).
-
-    Tries each non-cooling account in `order`; on 429/5xx/conn error it cools that
-    account (honoring Retry-After) and cascades to the next; on auth/budget error it
-    cools it for much longer. If the whole ring is cooling, waits for the soonest to
-    recover, up to MAX_RETRIES rounds. For streaming, status is checked before any
-    bytes are yielded so failover happens pre-stream.
-    """
-    last_resp, last_idx = None, order[-1]
-    rounds = 0
     queue_deadline = None if QUEUE_MAX_WAIT <= 0 else time.time() + QUEUE_MAX_WAIT
+    surprise_429s = 0
+    last_resp, last_idx = None, 0
     while True:
-        available = [i for i in order if _cooldown_remaining(i) <= 0 and UPSTREAM_KEYS[i - 1]]
-        if not available:
-            # All accounts cooling — wait for one to recover (queue behavior)
-            if queue_deadline is not None and time.time() >= queue_deadline:
+        max_wait = None
+        if queue_deadline is not None:
+            max_wait = queue_deadline - time.time()
+            if max_wait <= 0:
                 return last_resp, last_idx
-            soonest = min((_cooldown_remaining(i) for i in order), default=1.0)
-            time.sleep(min(max(soonest, 0.1), MAX_BACKOFF))
-            rounds += 1
-            continue
-        for idx in available:
-            headers = {
-                "Authorization": f"Bearer {UPSTREAM_KEYS[idx - 1]}",
-                "Content-Type": "application/json",
-            }
+        idx = acquire_slot(max_wait)
+        if idx == 0:
+            return last_resp, last_idx        # bounded queue wait exhausted
+        headers = {
+            "Authorization": f"Bearer {UPSTREAM_KEYS[idx - 1]}",
+            "Content-Type": "application/json",
+        }
+        try:
             try:
                 resp = requests.post(
                     f"{NEURALWATT_BASE_URL}/chat/completions",
-                    headers=headers, json=body, stream=stream,
-                    timeout=UPSTREAM_TIMEOUT_NONSTREAM if not stream else UPSTREAM_TIMEOUT,
+                    headers=headers, json=body, stream=False,
+                    timeout=UPSTREAM_TIMEOUT_NONSTREAM,
                 )
-            except requests.exceptions.ReadTimeout as e:
-                # Overload/latency on non-streaming: cool long, rotate reserve.
-                _set_cooldown(idx, OVERLOAD_COOLDOWN,
-                              reason="read timeout (overloaded)", http_status=None)
-                if UPSTREAM_STRATEGY == "active-reserve":
-                    _active_reserve_demote(idx, OVERLOAD_COOLDOWN,
-                                           reason="read timeout (overloaded)")
-                elif UPSTREAM_STRATEGY == "active-standby":
-                    _demote_to_standby(idx, OVERLOAD_COOLDOWN,
-                                       reason="read timeout (overloaded)")
+            except requests.exceptions.ReadTimeout:
+                pause_account(idx, ERROR_PAUSE, reason="read timeout",
+                              event_type="error_timeout")
                 last_idx = idx
-                log.warning("account '%s' (idx %d) READ TIMEOUT (overloaded); cooling %.0fs, rotating",
-                            account_name(idx), idx, OVERLOAD_COOLDOWN)
+                log.warning("account '%s' (idx %d) read timeout; retrying on another slot",
+                            account_name(idx), idx)
                 continue
             except requests.exceptions.RequestException as e:
-                _set_cooldown(idx, ACCOUNT_COOLDOWN,
+                pause_account(idx, ERROR_PAUSE,
                               reason=f"conn error: {type(e).__name__}")
-                if UPSTREAM_STRATEGY == "active-reserve":
-                    _active_reserve_demote(idx, ACCOUNT_COOLDOWN,
-                                           reason=f"conn error: {type(e).__name__}")
                 last_idx = idx
-                log.warning("account '%s' (idx %d) connection error (%s); cooling %ss",
-                            account_name(idx), idx, type(e).__name__, ACCOUNT_COOLDOWN)
+                log.warning("account '%s' (idx %d) connection error (%s); retrying on another slot",
+                            account_name(idx), idx, type(e).__name__)
                 continue
             code = resp.status_code
-            if code not in RETRY_STATUSES and code not in BUDGET_STATUSES:
-                return resp, idx                      # success (or non-retryable 4xx)
-            last_resp, last_idx = resp, idx
-            if stream:
-                resp.close()
-            if code in RETRY_STATUSES:
-                cd = max(_retry_delay(resp), ACCOUNT_COOLDOWN)
-                reason = f"retryable status {code}"
-                if UPSTREAM_STRATEGY == "active-standby" and code == 429:
-                    _demote_to_standby(idx, cd, reason=reason, http_status=code)
-                elif UPSTREAM_STRATEGY == "active-reserve":
-                    _active_reserve_demote(idx, cd, reason=reason, http_status=code)
-                else:
-                    _set_cooldown(idx, cd, reason=reason, http_status=code)
-                log.warning("account '%s' (idx %d) status %d; cooling %.1fs, failing over",
-                            account_name(idx), idx, code, cd)
-            else:
-                reason = f"auth/budget status {code}"
-                if UPSTREAM_STRATEGY == "active-standby":
-                    _demote_to_standby(idx, BUDGET_COOLDOWN, reason=reason, http_status=code)
-                elif UPSTREAM_STRATEGY == "active-reserve":
-                    _active_reserve_demote(idx, BUDGET_COOLDOWN, reason=reason, http_status=code)
-                else:
-                    _set_cooldown(idx, BUDGET_COOLDOWN, reason=reason, http_status=code)
-                log.warning("account '%s' (idx %d) auth/budget status %d; cooling %ss",
+            if code == 429:
+                # Slots full server-side (race / external consumer). Resync the
+                # local counter, then retry on any free slot — NO blacklist.
+                last_resp, last_idx = resp, idx
+                surprise_429s += 1
+                note_unexpected_429(idx)
+                log.warning("account '%s' (idx %d) unexpected 429 (%d this request); "
+                            "counter resynced, retrying in %d-%dms",
+                            account_name(idx), idx, surprise_429s,
+                            int(RETRY_429_WAIT_MIN * 1000), int(RETRY_429_WAIT_MAX * 1000))
+                if surprise_429s >= MAX_429_RETRIES:
+                    return resp, idx          # safety valve
+                time.sleep(random.uniform(RETRY_429_WAIT_MIN, RETRY_429_WAIT_MAX))
+                continue
+            if code in BUDGET_STATUSES:
+                last_resp, last_idx = resp, idx
+                park_account(idx, BUDGET_COOLDOWN,
+                             reason=f"auth/budget status {code}", http_status=code)
+                log.warning("account '%s' (idx %d) auth/budget status %d; parked %ss",
                             account_name(idx), idx, code, BUDGET_COOLDOWN)
-        # Loop back — if all accounts are now cooling, the top of the loop
-        # will wait for one to recover (queue behavior) instead of failing.
+                continue
+            if code in RETRY_STATUSES:        # 5xx family (429 handled above)
+                last_resp, last_idx = resp, idx
+                pause_account(idx, ERROR_PAUSE,
+                              reason=f"upstream {code}", http_status=code)
+                log.warning("account '%s' (idx %d) status %d; paused %.1fs, retrying elsewhere",
+                            account_name(idx), idx, code, ERROR_PAUSE)
+                continue
+            return resp, idx                  # success (or non-retryable 4xx)
+        finally:
+            # stream=False means the body is fully read by the time
+            # requests.post returns — the upstream request is complete, so the
+            # slot frees here on every path (success, error, or exception).
+            release_slot(idx)
 
 
 # ── STREAMING EVENT TYPES ─────────────────────────────────────────────────────
@@ -696,7 +686,7 @@ class ErrorEvent(StreamEvent):
 
 
 # ── STREAMING WITH HEARTBEAT + STALL FAILOVER ────────────────────────────────
-def stream_upstream(order, body):
+def stream_upstream(body):
     """Generator yielding StreamEvent instances for the streaming path.
 
     Yields one of:
@@ -707,52 +697,49 @@ def stream_upstream(order, body):
       ErrorEvent(str)       — terminal error message
 
     Handles:
-      - Pre-stream failover (429/5xx/conn error before any bytes)
+      - Slot acquisition: dispatches to the least-loaded account with a free
+        concurrency slot; if all accounts are at 3/3, queues (yielding SSE
+        heartbeats) and takes the first slot that frees
+      - Unexpected 429s: counter resync + fast retry on any free slot
+        (200-500ms), never a blacklist
       - SSE heartbeat comments every HEARTBEAT_INTERVAL before first token
-      - Mid-stream stall detection: if no chunks for STREAM_STALL_TIMEOUT seconds,
-        cool the account and retry on the next in the ring (up to MAX_STREAM_RETRIES)
+      - Mid-stream stall detection: if no chunks for STREAM_STALL_TIMEOUT
+        seconds, release the slot and retry (up to MAX_STREAM_RETRIES)
       - Usage extraction from SSE text
+    The slot is held for the FULL life of the stream and released on every
+    exit path (done, stall, overload, exception, client disconnect).
     """
     state = {"buf": "", "prompt_tokens": 0, "completion_tokens": 0,
              "cached_tokens": 0}
     body_copy = json.loads(json.dumps(body))  # deep copy — requests may consume it
-    tried = set()
     attempt = 0
+    surprise_429s = 0
+    queue_deadline = None if QUEUE_MAX_WAIT <= 0 else time.time() + QUEUE_MAX_WAIT
 
     while attempt <= MAX_STREAM_RETRIES:
-        # Pick next account: walk the ring order (active-standby or round-robin)
-        # skipping anything we already tried this request, then any non-cooling.
-        remaining = [i for i in order if i not in tried and _cooldown_remaining(i) <= 0]
-        if not remaining:
-            # Try accounts we already tried (maybe they've cooled down)
-            remaining = [i for i in order if _cooldown_remaining(i) <= 0]
-        if not remaining:
-            # All accounts in cooldown — wait for one to recover instead of
-            # failing. Yield heartbeats so the client/proxies don't time out.
-            log.info("all accounts cooling; queueing stream until one recovers")
-            deadline = None if QUEUE_MAX_WAIT <= 0 else time.time() + QUEUE_MAX_WAIT
-            poll_interval = min(HEARTBEAT_INTERVAL, 5.0)
-            while True:
-                yield HeartbeatEvent()
-                available = [i for i in order if _cooldown_remaining(i) <= 0 and UPSTREAM_KEYS[i - 1]]
-                if available:
-                    remaining = available
-                    break
-                if deadline is not None and time.time() >= deadline:
-                    retry_after = min(
-                        (_cooldown_remaining(i) for i in order if UPSTREAM_KEYS[i - 1]),
-                        default=ACCOUNT_COOLDOWN,
-                    )
+        # ── Acquire a concurrency slot (queue + heartbeat if all are at cap)
+        idx = try_acquire_slot()
+        if idx == 0:
+            wait_started = time.time()
+            last_hb = 0.0
+            log.info("all account slots busy (%d/%d in flight); queueing stream "
+                     "until one frees",
+                     inflight_snapshot()["total_in_flight"],
+                     NUM_UPSTREAM_KEYS * MAX_CONCURRENCY_PER_ACCOUNT)
+            while idx == 0:
+                if queue_deadline is not None and time.time() >= queue_deadline:
                     yield ErrorEvent(
-                        "all upstream accounts unavailable (queue wait exhausted)",
-                        retry_after=retry_after,
+                        "all upstream accounts at capacity (queue wait exhausted)",
+                        retry_after=1,
                     )
                     return
-                soonest = min((_cooldown_remaining(i) for i in order), default=poll_interval)
-                time.sleep(min(soonest, poll_interval))
+                if time.time() - last_hb >= HEARTBEAT_INTERVAL:
+                    last_hb = time.time()
+                    yield HeartbeatEvent()
+                wait_for_slot(0.25)
+                idx = try_acquire_slot()
+            note_queue_wait(time.time() - wait_started)
 
-        idx = remaining[0]
-        tried.add(idx)
         headers = {
             "Authorization": f"Bearer {UPSTREAM_KEYS[idx - 1]}",
             "Content-Type": "application/json",
@@ -764,123 +751,137 @@ def stream_upstream(order, body):
                 headers=headers, json=body_copy, stream=True, timeout=UPSTREAM_TIMEOUT,
             )
         except requests.exceptions.RequestException as e:
-            _set_cooldown(idx, ACCOUNT_COOLDOWN,
+            release_slot(idx)
+            pause_account(idx, ERROR_PAUSE,
                           reason=f"stream conn error: {type(e).__name__}")
-            if UPSTREAM_STRATEGY == "active-reserve":
-                _active_reserve_demote(idx, ACCOUNT_COOLDOWN,
-                                       reason=f"stream conn error: {type(e).__name__}")
-            log.warning("account '%s' (idx %d) connect error (%s); cooling %ss",
-                        account_name(idx), idx, type(e).__name__, ACCOUNT_COOLDOWN)
+            log.warning("account '%s' (idx %d) connect error (%s); retrying on another slot",
+                        account_name(idx), idx, type(e).__name__)
             attempt += 1
             continue
 
-        if resp.status_code in RETRY_STATUSES or resp.status_code in BUDGET_STATUSES:
+        if resp.status_code == 429:
+            # Slots full server-side despite our counter (race / external
+            # consumer). Resync + fast retry on any free slot — NO blacklist.
+            resp.close()
+            note_unexpected_429(idx)
+            release_slot(idx)
+            surprise_429s += 1
+            log.warning("account '%s' (idx %d) unexpected 429 (%d this request); "
+                        "counter resynced, retrying in %d-%dms",
+                        account_name(idx), idx, surprise_429s,
+                        int(RETRY_429_WAIT_MIN * 1000), int(RETRY_429_WAIT_MAX * 1000))
+            if surprise_429s >= MAX_429_RETRIES:
+                yield ErrorEvent(
+                    f"upstream rate limited after {surprise_429s} slot retries")
+                return
+            time.sleep(random.uniform(RETRY_429_WAIT_MIN, RETRY_429_WAIT_MAX))
+            continue
+
+        if resp.status_code in BUDGET_STATUSES:
             code = resp.status_code
             resp.close()
-            if code in RETRY_STATUSES:
-                cd = max(_retry_delay(resp), ACCOUNT_COOLDOWN)
-                reason = f"pre-stream retryable {code}"
-                if UPSTREAM_STRATEGY == "active-standby" and code == 429:
-                    _demote_to_standby(idx, cd, reason=reason, http_status=code)
-                elif UPSTREAM_STRATEGY == "active-reserve":
-                    _active_reserve_demote(idx, cd, reason=reason, http_status=code)
-                else:
-                    _set_cooldown(idx, cd, reason=reason, http_status=code)
-                log.warning("account '%s' (idx %d) pre-stream %d; cooling %.1fs, failing over",
-                            account_name(idx), idx, code, cd)
-            else:
-                reason = f"pre-stream auth/budget {code}"
-                if UPSTREAM_STRATEGY == "active-standby":
-                    _demote_to_standby(idx, BUDGET_COOLDOWN, reason=reason, http_status=code)
-                elif UPSTREAM_STRATEGY == "active-reserve":
-                    _active_reserve_demote(idx, BUDGET_COOLDOWN, reason=reason, http_status=code)
-                else:
-                    _set_cooldown(idx, BUDGET_COOLDOWN, reason=reason, http_status=code)
-                log.warning("account '%s' (idx %d) pre-stream auth/budget %d; cooling %ss",
-                            account_name(idx), idx, code, BUDGET_COOLDOWN)
+            release_slot(idx)
+            park_account(idx, BUDGET_COOLDOWN,
+                         reason=f"pre-stream auth/budget {code}", http_status=code)
+            log.warning("account '%s' (idx %d) pre-stream auth/budget %d; parked %ss",
+                        account_name(idx), idx, code, BUDGET_COOLDOWN)
+            attempt += 1
+            continue
+
+        if resp.status_code in RETRY_STATUSES:   # 5xx family (429 handled above)
+            code = resp.status_code
+            resp.close()
+            release_slot(idx)
+            pause_account(idx, ERROR_PAUSE,
+                          reason=f"pre-stream {code}", http_status=code)
+            log.warning("account '%s' (idx %d) pre-stream %d; paused %.1fs, failing over",
+                        account_name(idx), idx, code, ERROR_PAUSE)
             attempt += 1
             continue
 
         if resp.status_code >= 400:
             detail = resp.content.decode("utf-8", "replace")[:500]
+            code = resp.status_code
             resp.close()
-            yield ErrorEvent(f"upstream {resp.status_code}: {detail}")
+            release_slot(idx)
+            yield ErrorEvent(f"upstream {code}: {detail}")
             return
 
-        # ── Stream is live — yield chunks with heartbeat + stall detection
-        yield AccountEvent(idx)
+        # ── Stream is live — yield chunks with heartbeat + stall detection.
+        # The slot stays held until this attempt fully ends; the finally below
+        # releases it on EVERY exit (done, stall, overload, exception, and
+        # GeneratorExit when the client disconnects mid-stream).
         first_token_received = False
         request_started_at = time.time()
-        last_chunk_time = time.time()
         stalled = False
         overloaded = False
 
         try:
-            with resp:
-                for chunk in _iter_with_heartbeat(resp, HEARTBEAT_INTERVAL,
-                                                   STREAM_STALL_TIMEOUT):
-                    if chunk is None:
-                        # Heartbeat timeout — no data for HEARTBEAT_INTERVAL
-                        if not first_token_received:
-                            # Overload check: if first token has taken too long,
-                            # treat this account as overloaded — instantly
-                            # demote (active-reserve rotation) and fail over.
-                            if (FIRST_TOKEN_TIMEOUT > 0
-                                    and time.time() - request_started_at >= FIRST_TOKEN_TIMEOUT):
-                                overloaded = True
-                                break
-                            yield HeartbeatEvent()
-                        continue
-                    if chunk is _STALL_SENTINEL:
-                        # No data for STREAM_STALL_TIMEOUT — stalled
-                        stalled = True
-                        break
+            yield AccountEvent(idx)
+            try:
+                with resp:
+                    for chunk in _iter_with_heartbeat(resp, HEARTBEAT_INTERVAL,
+                                                       STREAM_STALL_TIMEOUT):
+                        if chunk is None:
+                            # Heartbeat timeout — no data for HEARTBEAT_INTERVAL
+                            if not first_token_received:
+                                # Overload check: first token taking too long —
+                                # fail over to another slot rather than sit here.
+                                if (FIRST_TOKEN_TIMEOUT > 0
+                                        and time.time() - request_started_at >= FIRST_TOKEN_TIMEOUT):
+                                    overloaded = True
+                                    break
+                                yield HeartbeatEvent()
+                            continue
+                        if chunk is _STALL_SENTINEL:
+                            # No data for STREAM_STALL_TIMEOUT — stalled
+                            stalled = True
+                            break
 
-                    first_token_received = True
-                    last_chunk_time = time.time()
-                    try:
-                        _extract_usage_from_sse_text(
-                            chunk.decode("utf-8", "replace"), state
-                        )
-                    except Exception:
-                        pass
-                    yield ChunkEvent(chunk)
-        except Exception as e:
-            log.warning("stream exception on '%s' (idx %d): %s",
-                        account_name(idx), idx, type(e).__name__)
+                        first_token_received = True
+                        try:
+                            _extract_usage_from_sse_text(
+                                chunk.decode("utf-8", "replace"), state
+                            )
+                        except Exception:
+                            pass
+                        yield ChunkEvent(chunk)
+            except Exception as e:
+                log.warning("stream exception on '%s' (idx %d): %s",
+                            account_name(idx), idx, type(e).__name__)
+        finally:
+            release_slot(idx)
+            try:
+                resp.close()
+            except Exception:
+                pass
 
         if overloaded:
-            # Instant demotion: this key is saturated — give it a long rest and
-            # rotate the reserve in. Faster than waiting out the stall timeout.
-            _set_cooldown(idx, OVERLOAD_COOLDOWN,
-                          reason=f"overloaded: no first token in {FIRST_TOKEN_TIMEOUT:.1f}s")
-            if UPSTREAM_STRATEGY == "active-reserve":
-                _active_reserve_demote(idx, OVERLOAD_COOLDOWN,
-                                       reason="overloaded: no first token")
+            # No first token in FIRST_TOKEN_TIMEOUT — the request itself may
+            # be wedged. Slot is already released; brief breather so the next
+            # attempt prefers other accounts, then retry.
+            pause_account(idx, ERROR_PAUSE,
+                          reason=f"overloaded: no first token in {FIRST_TOKEN_TIMEOUT:.1f}s",
+                          event_type="error_overload")
             log.warning("account '%s' (idx %d) OVERLOADED (no first token in %.1fs); "
-                        "cooling %.0fs, instant rotation (attempt %d/%d)",
+                        "slot released, retrying elsewhere (attempt %d/%d)",
                         account_name(idx), idx, FIRST_TOKEN_TIMEOUT,
-                        OVERLOAD_COOLDOWN, attempt + 1, MAX_STREAM_RETRIES)
-            resp.close()
+                        attempt + 1, MAX_STREAM_RETRIES)
             attempt += 1
             continue
 
         if stalled:
-            _set_cooldown(idx, ACCOUNT_COOLDOWN,
-                          reason=f"stalled mid-stream: no data {STREAM_STALL_TIMEOUT:.0f}s")
-            if UPSTREAM_STRATEGY == "active-reserve":
-                _active_reserve_demote(idx, ACCOUNT_COOLDOWN,
-                                       reason="stalled mid-stream")
+            pause_account(idx, ERROR_PAUSE,
+                          reason=f"stalled mid-stream: no data {STREAM_STALL_TIMEOUT:.0f}s",
+                          event_type="error_stall")
             log.warning("account '%s' (idx %d) stalled mid-stream (no data %ss); "
-                        "cooling and failing over (attempt %d/%d)",
+                        "slot released, retrying (attempt %d/%d)",
                         account_name(idx), idx, STREAM_STALL_TIMEOUT,
-                        ACCOUNT_COOLDOWN, attempt + 1, MAX_STREAM_RETRIES)
-            resp.close()
+                        attempt + 1, MAX_STREAM_RETRIES)
             attempt += 1
             continue
 
         # Normal end of stream
-        resp.close()
         yield DoneEvent(state)
         return
 
@@ -1071,7 +1072,7 @@ def init_db() -> None:
     if "served_upstream_index" not in cols:
         db.execute("ALTER TABLE usage ADD COLUMN served_upstream_index INTEGER")
         log.info("migrated: added usage.served_upstream_index")
-    # Events log: cooldown starts/recoveries, errors, retries. Bounded by
+    # Events log: 429 resyncs, parks, errors, retries. Bounded by
     # _prune_events() so a stress test can't grow this unbounded.
     db.executescript(
         """
@@ -1482,8 +1483,6 @@ def chat_completions():
     if err is not None:
         return err
     api_key_row, _customer_row = res
-    # Ring order (active-standby by default; round-robin if configured).
-    order = ring_order(api_key_row["upstream_key_index"])
 
     body = request.get_json(silent=True)
     if not body:
@@ -1507,7 +1506,7 @@ def chat_completions():
                 done_sent = False
                 state = {"buf": "", "prompt_tokens": 0, "completion_tokens": 0,
                          "cached_tokens": 0}
-                upstream_gen = stream_upstream(order, body)
+                upstream_gen = stream_upstream(body)
                 try:
                     for event in upstream_gen:
                         if _client_disconnected():
@@ -1588,19 +1587,17 @@ def chat_completions():
             )
 
         # ── NON-STREAMING ──────────────────────────────────────────────────
-        # Ring failover + cooldown.
-        resp, served_idx = post_upstream(order, body, stream=False)
+        # Concurrency-slot dispatch (queues while all accounts are at cap).
+        resp, served_idx = post_upstream(body)
         if resp is None:
-            # Whole ring cooling and queue wait elapsed — emit 503 + Retry-After
-            # so the client knows when the soonest account recovers. Error must
-            # be an OBJECT (OpenAI schema) so VS Code / Cursor don't reject the
-            # response as "Type validation failed" (string-vs-object union fail).
-            retry_after = int(max(1, round(min(
-                (_cooldown_remaining(i) for i in order if UPSTREAM_KEYS[i - 1]),
-                default=ACCOUNT_COOLDOWN,
-            ))))
+            # Every account at cap and the bounded queue wait elapsed. Slots
+            # free as soon as any in-flight request finishes, so the honest
+            # retry hint is simply "soon" — 1s. Error must be an OBJECT
+            # (OpenAI schema) so VS Code / Cursor don't reject the response
+            # as "Type validation failed" (string-vs-object union fail).
+            retry_after = 1
             response = jsonify(openai_error(
-                "all upstream accounts unavailable", "server_error",
+                "all upstream accounts at capacity", "server_error",
                 503, retry_after=retry_after,
             ))
             response.headers["Retry-After"] = str(retry_after)
@@ -1828,6 +1825,8 @@ def _admin_summary_data(db: sqlite3.Connection) -> dict:
         })
 
     upstream = []
+    slots = inflight_snapshot()
+    slot_by_idx = {a["upstream_key_index"]: a for a in slots["accounts"]}
     for i in range(1, NUM_UPSTREAM_KEYS + 1):
         assigned = db.execute(
             """SELECT COUNT(DISTINCT id) AS keys_assigned,
@@ -1842,18 +1841,21 @@ def _admin_summary_data(db: sqlite3.Connection) -> dict:
                FROM usage WHERE served_upstream_index = ?""",
             (i,)
         ).fetchone()
-        # Per-account event counts (429s, cooldowns, errors) for the test
+        # Per-account event counts (429s, parks, errors) for the test
         # harness. "last_event_ts" is the most recent event for this account.
         evstats = db.execute(
             """SELECT
                    COUNT(*) AS total_events,
-                   SUM(CASE WHEN event_type = 'cooldown_start' THEN 1 ELSE 0 END) AS cooldowns,
+                   SUM(CASE WHEN event_type IN ('error_budget', 'park_start')
+                       THEN 1 ELSE 0 END) AS parks,
                    SUM(CASE WHEN event_type = 'error_429' THEN 1 ELSE 0 END) AS err_429,
                    SUM(CASE WHEN event_type LIKE 'error_%' THEN 1 ELSE 0 END) AS errors,
                    MAX(timestamp) AS last_event_ts
                FROM events WHERE upstream_key_index = ?""",
             (i,)
         ).fetchone()
+        slot = slot_by_idx.get(i, {})
+        parked_s = slot.get("parked_s", 0.0)
         entry = {
             "upstream_key_index": i,
             "account_name": account_name(i),
@@ -1862,32 +1864,26 @@ def _admin_summary_data(db: sqlite3.Connection) -> dict:
             "served_requests": served["requests"],
             "served_tokens": served["total_tokens"],
             "served_cost_usd": round(served["total_cost"] or 0, 6),
-            "cooling_down_s": round(_cooldown_remaining(i), 1),
-            "is_standby": (UPSTREAM_STRATEGY == "active-standby"
-                           and _STANDBY_IDX == i),
-            "cooldown_count": evstats["cooldowns"] or 0,
+            # In-flight concurrency slots (the live routing signal).
+            "in_flight": slot.get("in_flight", 0),
+            "max_concurrency": MAX_CONCURRENCY_PER_ACCOUNT,
+            "free_slots": slot.get("free_slots", MAX_CONCURRENCY_PER_ACCOUNT),
+            "peak_in_flight": slot.get("peak_in_flight", 0),
+            # "cooling_down_s" kept for dashboard/poller compat — now it only
+            # reflects a budget/auth park, never a 429.
+            "cooling_down_s": parked_s,
+            "cooldown_count": evstats["parks"] or 0,
             "error_429_count": evstats["err_429"] or 0,
             "error_count": evstats["errors"] or 0,
             "last_event_ts": evstats["last_event_ts"],
+            "pool_role": ("parked" if parked_s > 0
+                          else ("busy" if slot.get("free_slots", 1) == 0
+                                else "active")),
         }
-        if UPSTREAM_STRATEGY == "active-reserve":
-            ar_active, ar_reserve = _active_reserve_state()
-            if i in ar_active:
-                entry["pool_role"] = "active"
-            elif _cooldown_remaining(i) > 0:
-                entry["pool_role"] = "cooling"
-            else:
-                entry["pool_role"] = "reserve"
-        elif UPSTREAM_STRATEGY == "active-standby":
-            entry["pool_role"] = (
-                "standby" if _STANDBY_IDX == i else "active"
-            )
-        else:
-            entry["pool_role"] = "active"
         upstream.append(entry)
 
-    # Recent error/cooldown events — the "error logs" the test harness needs
-    # to correlate 429 timing, cooldown start, and recovery per account.
+    # Recent error/park events — the "error logs" the test harness needs
+    # to correlate 429 timing and parks per account.
     recent_events = []
     for row in db.execute(
         """SELECT timestamp, upstream_key_index, account_name,
@@ -1933,7 +1929,14 @@ def _admin_summary_data(db: sqlite3.Connection) -> dict:
         })
 
     return {
-        "strategy": UPSTREAM_STRATEGY,
+        "strategy": "concurrency-slots",
+        "concurrency": {
+            "max_per_account": MAX_CONCURRENCY_PER_ACCOUNT,
+            "total_in_flight": slots["total_in_flight"],
+            "queue_waiting": slots["queue_waiting"],
+            "available_accounts": slots["available_accounts"],
+            "stats": slots["stats"],
+        },
         "pricing": {
             "input_price_per_m": YOUR_INPUT_PRICE_PER_M,
             "output_price_per_m": YOUR_OUTPUT_PRICE_PER_M,
@@ -2073,7 +2076,8 @@ ADMIN_SUMMARY_PAGE = """<!doctype html>
   .pill svg { width: 12px; height: 12px; }
   .pill.active { color: var(--positive); background: var(--positive-dim); }
   .pill.standby, .pill.reserve { color: var(--cool); background: rgba(96,165,250,.14); }
-  .pill.cooling { color: var(--cooling); background: rgba(245,158,11,.14); }
+  .pill.cooling, .pill.busy { color: var(--cooling); background: rgba(245,158,11,.14); }
+  .pill.parked { color: var(--negative); background: rgba(248,113,113,.14); }
 
   .acc .cooldown {
     font-size: 12px; color: var(--cooling); margin-left: 8px; padding-left: 8px;
@@ -2235,7 +2239,7 @@ ADMIN_SUMMARY_PAGE = """<!doctype html>
     </div>
   </div>
 
-  <footer>Auto-refreshes every 15s. Cooldowns tick down live.</footer>
+  <footer>Auto-refreshes every 15s. Park timers tick down live.</footer>
 </div>
 
 <noscript>
@@ -2267,6 +2271,8 @@ ADMIN_SUMMARY_PAGE = """<!doctype html>
     standby: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
     cooling: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/><circle cx="12" cy="12" r="4"/></svg>'
   };
+  ICONS.busy = ICONS.cooling;
+  ICONS.parked = ICONS.standby;
 
   function el(tag, cls, html) {
     var e = document.createElement(tag);
@@ -2315,8 +2321,9 @@ ADMIN_SUMMARY_PAGE = """<!doctype html>
       var u = ups[i];
       var role = u.pool_role || "active";
       var card = el("div", "acc");
-      // Green when active; red for any inactive/standby/reserve/cooling state.
-      var statusColor = (role === "active") ? "var(--positive)" : "var(--negative)";
+      // Green = free slot(s); amber = all 3 slots busy; red = parked (budget).
+      var statusColor = (role === "active") ? "var(--positive)"
+        : (role === "busy") ? "var(--cooling)" : "var(--negative)";
       card.style.setProperty("--hue", statusColor);
 
       var head = el("div", "head");
@@ -2336,14 +2343,18 @@ ADMIN_SUMMARY_PAGE = """<!doctype html>
       card.appendChild(head);
 
       var stats = el("div", "stats");
+      stats.appendChild(pair("In flight",
+        (u.in_flight || 0) + "/" + (u.max_concurrency || 3) +
+        " (peak " + (u.peak_in_flight || 0) + ")"));
       stats.appendChild(pair("Tokens served", fmtNum(u.served_tokens)));
       stats.appendChild(pair("Requests served", fmtNum(u.served_requests)));
       stats.appendChild(pair("Keys assigned", u.keys_assigned));
       stats.appendChild(pair("Customers", u.customers_assigned));
-      // Error/cooldown counters highlighted for the stress test.
+      // Error counters highlighted for the stress test. 429s no longer
+      // blacklist — they're counter-resync events.
       if ((u.cooldown_count || 0) > 0 || (u.error_429_count || 0) > 0) {
         stats.appendChild(pair("429s seen", u.error_429_count || 0));
-        stats.appendChild(pair("Cooldowns", u.cooldown_count || 0));
+        stats.appendChild(pair("Parks", u.cooldown_count || 0));
       }
       card.appendChild(stats);
 
@@ -2593,6 +2604,15 @@ def admin_summary():
     return jsonify(data)
 
 
+@app.route("/admin/inflight", methods=["GET"])
+@require_admin
+def admin_inflight():
+    """Lightweight JSON snapshot of per-account in-flight slots. No DB access,
+    safe to poll at 1Hz from the test harness to chart slot usage over time
+    and verify counts never exceed MAX_CONCURRENCY_PER_ACCOUNT."""
+    return jsonify(inflight_snapshot())
+
+
 @app.route("/admin/customer/<int:customer_id>", methods=["DELETE"])
 @require_admin
 def admin_delete_customer(customer_id: int):
@@ -2771,7 +2791,7 @@ if __name__ == "__main__":
 |   No upstream read-timeout: long generations won't chop. |
 +==========================================================+
 
-Upstream account ring (names only — keys never printed):""")
+Upstream account pool (names only — keys never printed):""")
     for i in range(1, NUM_UPSTREAM_KEYS + 1):
         print(f"  [{i}] {account_name(i)}")
     print("\nModel mappings:")
