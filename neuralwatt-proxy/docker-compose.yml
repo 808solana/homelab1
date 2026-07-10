@@ -1,0 +1,50 @@
+version: '3.8'
+services:
+  proxy:
+    build: .
+    container_name: luv13-proxy
+    restart: always
+    ports:
+      - "4000:4000"
+    environment:
+      # Auth secrets
+      - ADMIN_TOKEN=${ADMIN_TOKEN}
+      - JWT_SECRET=${JWT_SECRET}
+      # Browser login for /admin/* (https://api.luv13.com/admin/login)
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      - ADMIN_SESSION_TTL_DAYS=${ADMIN_SESSION_TTL_DAYS:-7}
+      # Optional tunables
+      - NEURALWATT_BASE_URL=${NEURALWATT_BASE_URL:-https://api.neuralwatt.com/v1}
+      - PORT=4000
+      - YOUR_INPUT_PRICE_PER_M=${YOUR_INPUT_PRICE_PER_M:-0.23}
+      - YOUR_OUTPUT_PRICE_PER_M=${YOUR_OUTPUT_PRICE_PER_M:-0.23}
+      - YOUR_CACHED_INPUT_PRICE_PER_M=${YOUR_CACHED_INPUT_PRICE_PER_M:-0.23}
+      - BLENDED_COST_PER_M=${BLENDED_COST_PER_M:-0.10}
+      - MAX_KEYS_PER_CUSTOMER=${MAX_KEYS_PER_CUSTOMER:-5}
+      # Cooldown / failover tunables
+      - PROXY_MAX_RETRIES=${PROXY_MAX_RETRIES:-1}
+      - PROXY_MAX_BACKOFF=${PROXY_MAX_BACKOFF:-30}
+      - PROXY_ACCOUNT_COOLDOWN=${PROXY_ACCOUNT_COOLDOWN:-60}
+      - PROXY_BUDGET_COOLDOWN=${PROXY_BUDGET_COOLDOWN:-300}
+      # Streaming heartbeat + stall failover
+      - PROXY_HEARTBEAT_INTERVAL=${PROXY_HEARTBEAT_INTERVAL:-5}
+      - STREAM_STALL_TIMEOUT_MS=${STREAM_STALL_TIMEOUT_MS:-60000}
+      - PROXY_MAX_STREAM_RETRIES=${PROXY_MAX_STREAM_RETRIES:-50}
+      - PROXY_CONNECT_TIMEOUT=${PROXY_CONNECT_TIMEOUT:-60}
+      # Overload protection: if first token takes >N ms, demote + instantly rotate
+      - PROXY_FIRST_TOKEN_TIMEOUT_MS=${PROXY_FIRST_TOKEN_TIMEOUT_MS:-10000}
+      - PROXY_OVERLOAD_COOLDOWN=${PROXY_OVERLOAD_COOLDOWN:-120}
+      - PROXY_NONSTREAM_READ_TIMEOUT=${PROXY_NONSTREAM_READ_TIMEOUT:-10}
+      # Queue wait: when all accounts are cooling, hold + heartbeat (not 503). 30=bounded wait, then 503 + Retry-After.
+      - PROXY_QUEUE_MAX_WAIT=${PROXY_QUEUE_MAX_WAIT:-0}
+      # Upstream routing:
+      #   "active-standby" (N-1 active + 1 standby, default)
+      #   "round-robin"
+      #   "active-reserve" (PROXY_ACTIVE_COUNT active + PROXY_RESERVE_COUNT reserve)
+      - PROXY_UPSTREAM_STRATEGY=${PROXY_UPSTREAM_STRATEGY:-active-standby}
+      - PROXY_ACTIVE_COUNT=${PROXY_ACTIVE_COUNT:-3}
+      - PROXY_RESERVE_COUNT=${PROXY_RESERVE_COUNT:-3}
+    volumes:
+      # SQLite DB persists across container rebuilds / restarts.
+      - ./data:/app/data

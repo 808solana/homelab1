@@ -1,0 +1,12 @@
+services:
+  chat-assets-nginx:
+    image: nginx:alpine
+    container_name: chat-assets-nginx
+    restart: unless-stopped
+    ports:
+      - "8083:80"
+    volumes:
+      # Mount the existing chat-assets dir read-only at the web root.
+      # Files in /home/kor/chat-assets are served at https://images.korgems.com/<file>
+      - /home/kor/chat-assets:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro

@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Luv13 Proxy — Burst Monitor</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box}
+  html,body{margin:0;padding:0;height:100%;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:#e5e7eb}
+  body{
+    min-height:100vh;
+    background:
+      radial-gradient(1200px 800px at 80% -10%, rgba(99,102,241,.15), transparent 60%),
+      radial-gradient(900px 600px at 0% 100%, rgba(16,185,129,.10), transparent 60%),
+      #07070a;
+    display:flex;flex-direction:column;gap:18px;padding:18px;
+  }
+
+  /* ── Top control panel ───────────────────────────────────────────── */
+  .panel{
+    backdrop-filter: blur(14px);
+    background: rgba(20,20,28,.6);
+    border:1px solid rgba(255,255,255,.08);
+    border-radius:16px;
+    padding:16px 18px;
+    box-shadow:0 10px 40px rgba(0,0,0,.45);
+    display:flex;flex-wrap:wrap;gap:12px;align-items:center;
+  }
+  .panel h1{
+    margin:0 14px 0 0;font-size:15px;font-weight:600;letter-spacing:.3px;
+    color:#fff;display:flex;align-items:center;gap:8px;
+  }
+  .panel h1 .dot{width:8px;height:8px;border-radius:50%;background:#10b981;box-shadow:0 0 12px #10b981;animation:pulse 2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+
+  .field{display:flex;flex-direction:column;gap:4px;flex:1;min-width:180px}
+  .field label{font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:#9ca3af}
+  input,select{
+    background:rgba(10,10,14,.85);border:1px solid rgba(255,255,255,.1);
+    color:#e5e7eb;border-radius:9px;padding:9px 11px;font-size:13px;outline:none;
+    transition:border-color .15s, box-shadow .15s;font-family:inherit;
+  }
+  input:focus,select:focus{border-color:#6366f1;box-shadow:0 0 0 3px rgba(99,102,241,.18)}
+
+  .btn{
+    cursor:pointer;border-radius:9px;padding:10px 16px;font-size:13px;font-weight:600;
+    border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.06);color:#e5e7eb;
+    transition:transform .08s, background .15s, border-color .15s;user-select:none;
+  }
+  .btn:hover{background:rgba(255,255,255,.12)}
+  .btn:active{transform:translateY(1px)}
+  .btn.primary{background:linear-gradient(180deg,#4f46e5,#4338ca);border-color:#6366f1;color:#fff}
+  .btn.primary:hover{background:linear-gradient(180deg,#5b52f0,#4f46e5)}
+  .btn.danger{background:linear-gradient(180deg,#dc2626,#b91c1c);border-color:#ef4444;color:#fff}
+  .btn.danger:hover{background:linear-gradient(180deg,#ef4444,#dc2626)}
+  .btn[disabled]{opacity:.5;cursor:not-allowed}
+
+  .stat{
+    display:flex;flex-direction:column;gap:2px;min-width:80px;
+    padding:6px 12px;border-left:1px solid rgba(255,255,255,.08);
+  }
+  .stat .k{font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:#9ca3af}
+  .stat .v{font-size:16px;font-weight:700;color:#fff;font-variant-numeric:tabular-nums}
+
+  /* ── Middle grid ────────────────────────────────────────────────── */
+  #stage{
+    flex:1;display:flex;align-items:center;justify-content:center;
+    min-height:380px;position:relative;
+  }
+  #empty{
+    position:absolute;text-align:center;color:#5b6072;font-size:13px;line-height:1.6;
+    pointer-events:none;
+  }
+  #empty .emoji{font-size:34px;display:block;margin-bottom:8px;opacity:.6}
+  #grid{
+    display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;
+    width:100%;max-width:820px;
+  }
+  .card{
+    border-radius:16px;padding:18px;position:relative;overflow:hidden;
+    color:#fff;min-height:120px;display:flex;flex-direction:column;justify-content:space-between;
+    background:#0a0a0a;border:1px solid rgba(255,255,255,.08);
+    box-shadow:0 10px 30px rgba(0,0,0,.5);
+    transition:background .5s ease, border-color .5s, opacity .35s, transform .35s;
+    animation:cardIn .4s cubic-bezier(.2,.9,.3,1.2) both;
+  }
+  @keyframes cardIn{
+    from{opacity:0;transform:translateY(10px) scale(.92)}
+    to{opacity:1;transform:none}
+  }
+  .card.out{opacity:0;transform:scale(.9) translateY(-6px);pointer-events:none}
+  .card .name{font-size:18px;font-weight:700;letter-spacing:.4px}
+  .card .sub{font-size:11px;opacity:.7;text-transform:uppercase;letter-spacing:.6px;margin-top:2px}
+  .card .count{font-size:32px;font-weight:800;font-variant-numeric:tabular-nums;letter-spacing:-1px}
+  .card .count small{font-size:13px;font-weight:500;opacity:.7;margin-left:4px}
+  .card .badge{
+    align-self:flex-start;font-size:10px;font-weight:600;letter-spacing:.6px;text-transform:uppercase;
+    padding:3px 8px;border-radius:999px;background:rgba(255,255,255,.14);margin-top:6px;
+  }
+
+  /* color states */
+  .card.active{background:#000;border-color:rgba(255,255,255,.18)}
+  .card.active .badge{background:rgba(255,255,255,.18)}
+  .card.limited{background:linear-gradient(180deg,#dc2626,#991b1b);border-color:#ef4444;animation:shake .4s}
+  @keyframes shake{0%,100%{transform:none}25%{transform:translateX(-3px)}75%{transform:translateX(3px)}}
+  .card.recovered{background:linear-gradient(180deg,#16a34a,#15803d);border-color:#22c55e}
+  .card.pulse::after{
+    content:"";position:absolute;inset:0;border-radius:16px;border:2px solid rgba(255,255,255,.5);
+    animation:flash .6s ease-out;pointer-events:none;
+  }
+  @keyframes flash{0%{opacity:.9}100%{opacity:0}}
+
+  /* footer log */
+  #log{
+    height:120px;overflow:auto;border-radius:12px;border:1px solid rgba(255,255,255,.08);
+    background:rgba(10,10,14,.7);padding:10px 12px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+    color:#9ca3af;
+  }
+  #log .row{display:flex;gap:10px;align-items:baseline}
+  #log .t{color:#5b6072;min-width:90px}
+  #log .ok{color:#10b981}
+  #log .err{color:#ef4444}
+  #log .warn{color:#f59e0b}
+  #log .acc{color:#a5b4fc;min-width:70px}
+</style>
+</head>
+<body>
+
+  <div class="panel">
+    <h1><span class="dot"></span> Luv13 Burst Monitor</h1>
+
+    <div class="field" style="min-width:240px">
+      <label>Base URL</label>
+      <input id="baseUrl" value="https://api.luv13.com/v1" placeholder="https://api.luv13.com/v1">
+    </div>
+    <div class="field" style="min-width:240px">
+      <label>API Key</label>
+      <input id="apiKey" type="password" placeholder="sk-luv13-...">
+    </div>
+    <div class="field" style="min-width:150px">
+      <label>Model</label>
+      <input id="model" value="luv13-glm-5.2-fast">
+    </div>
+
+    <button class="btn primary" id="send1">Send 1</button>
+    <button class="btn primary" id="burstBtn">Burst</button>
+    <div class="field" style="min-width:90px;max-width:110px">
+      <label>Req / sec</label>
+      <input id="rate" type="number" min="1" max="50" value="6" style="width:90px">
+    </div>
+    <button class="btn danger" id="stopBtn" disabled>Stop</button>
+
+    <div class="stat"><span class="k">Sent</span><span class="v" id="statSent">0</span></div>
+    <div class="stat"><span class="k">Served</span><span class="v" id="statServed">0</span></div>
+    <div class="stat"><span class="k">Errors</span><span class="v" id="statErr">0</span></div>
+  </div>
+
+  <div id="stage">
+    <div id="empty">
+      <span class="emoji">⚡</span>
+      Enter your Base URL + API key, then hit <b>Send 1</b> or <b>Burst</b>.<br>
+      APIs will appear here as they handle your requests.
+    </div>
+    <div id="grid"></div>
+  </div>
+
+  <div id="log"></div>
+
+<script>
+  // ── Element refs ──────────────────────────────────────────────────
+  const $ = id => document.getElementById(id);
+  const grid = $("grid"), empty = $("empty"), logBox = $("log");
+
+  // ── Stats ─────────────────────────────────────────────────────────
+  let sent = 0, served = 0, errors = 0;
+  const stats = () => {
+    $("statSent").textContent = sent;
+    $("statServed").textContent = served;
+    $("statErr").textContent = errors;
+  };
+
+  // ── Account model ─────────────────────────────────────────────────
+  // state: "active" | "limited" | "recovered" | removed
+  const accounts = new Map(); // name -> {count, lastSeen, state, since, cooldownUntil}
+
+  const ACTIVE_IDLE_MS   = 3000;   // idle -> green (reserve) transition
+  const RECOVERED_LIVE_MS = 2200;   // green card visible before fade-out
+  const DEFAULT_CD_MS    = 120000;  // assume overload cooldown if no Retry-After
+
+  function now(){ return Date.now(); }
+
+  function touch(name){
+    if (!name) return;
+    let acc = accounts.get(name);
+    if (!acc){
+      acc = {count:0, state:"active", since:now(), lastSeen:now(), cooldownUntil:0, flash:false};
+      accounts.set(name, acc);
+    }
+    // If it was red and is serving again → recovered (green)
+    if (acc.state === "limited"){
+      acc.state = "recovered";
+      acc.since = now();
+    } else if (acc.state !== "recovered"){
+      acc.state = "active";
+    }
+    acc.count += 1;
+    acc.lastSeen = now();
+    acc.flash = true;
+    render(name);
+    setTimeout(()=>{ acc.flash = false; render(name); }, 650);
+  }
+
+  function markLimited(name, retryAfterSeconds){
+    if (!name) return;
+    let acc = accounts.get(name);
+    if (!acc){
+      acc = {count:0, state:"limited", since:now(), lastSeen:now(), cooldownUntil:0, flash:false};
+      accounts.set(name, acc);
+    }
+    acc.state = "limited";
+    const cd = (retryAfterSeconds ? parseFloat(retryAfterSeconds) : DEFAULT_CD_MS/1000) * 1000;
+    acc.cooldownUntil = now() + cd;
+    render(name);
+  }
+
+  // ── Heartbeat: transition idle/red -> green/remove ───────────────
+  setInterval(()=>{
+    const t = now();
+    for (const [name, acc] of accounts){
+      const idleFor = t - acc.lastSeen;
+      if (acc.state === "active" && idleFor > ACTIVE_IDLE_MS){
+        // became reserve
+        acc.state = "recovered";
+        acc.since = t;
+        render(name);
+      } else if (acc.state === "recovered"){
+        // green card: visible for a bit then removed (unless serving again)
+        if (idleFor > RECOVERED_LIVE_MS && t - acc.since > RECOVERED_LIVE_MS){
+          removeCard(name);
+        }
+      } else if (acc.state === "limited"){
+        // cooldown done? -> green briefly then gone
+        if (acc.cooldownUntil && t >= acc.cooldownUntil){
+          acc.state = "recovered";
+          acc.since = t;
+          acc.lastSeen = t; // start fresh so green lives ~2s
+          render(name);
+        }
+      }
+    }
+  }, 250);
+
+  // ── Rendering ────────────────────────────────────────────────────
+  function cardEl(name){
+    let el = document.querySelector(`.card[data-name="${cssEscape(name)}"]`);
+    if (!el){
+      el = document.createElement("div");
+      el.className = "card";
+      el.dataset.name = name;
+      el.innerHTML = `
+        <div>
+          <div class="name"></div>
+          <div class="sub">API</div>
+        </div>
+        <div>
+          <div class="count">0<small>reqs</small></div>
+          <span class="badge"></span>
+        </div>`;
+      grid.appendChild(el);
+    }
+    return el;
+  }
+
+  function render(name){
+    const acc = accounts.get(name);
+    if (!acc) return;
+    const el = cardEl(name);
+    el.querySelector(".name").textContent = name;
+    el.querySelector(".count").firstChild.nodeValue = String(acc.count);
+    const badge = el.querySelector(".badge");
+    el.classList.remove("active","limited","recovered","pulse");
+    if (acc.flash) el.classList.add("pulse");
+    if (acc.state === "active"){
+      el.classList.add("active");
+      badge.textContent = "Active";
+    } else if (acc.state === "limited"){
+      el.classList.add("limited");
+      const secs = acc.cooldownUntil ? Math.max(0, Math.ceil((acc.cooldownUntil - now())/1000)) : 0;
+      badge.textContent = secs ? `Cooldown ${secs}s` : "Rate-limited";
+    } else if (acc.state === "recovered"){
+      el.classList.add("recovered");
+      badge.textContent = "Reserve";
+    }
+    empty.style.display = accounts.size ? "none" : "block";
+  }
+
+  function removeCard(name){
+    const el = document.querySelector(`.card[data-name="${cssEscape(name)}"]`);
+    accounts.delete(name);
+    if (el){
+      el.classList.add("out");
+      setTimeout(()=> el.remove(), 380);
+    }
+    empty.style.display = accounts.size ? "none" : "block";
+  }
+
+  function cssEscape(s){
+    return String(s).replace(/[^a-zA-Z0-9_-]/g, m => "\\" + m);
+  }
+
+  // ── Log ──────────────────────────────────────────────────────────
+  function log(kind, account, msg){
+    const row = document.createElement("div");
+    row.className = "row";
+    const t = new Date().toLocaleTimeString();
+    row.innerHTML = `<span class="t">${t}</span><span class="acc">${account||"-"}</span><span class="${kind}">${msg}</span>`;
+    logBox.prepend(row);
+    while (logBox.children.length > 80) logBox.removeChild(logBox.lastChild);
+  }
+
+  // ── Send a request ────────────────────────────────────────────────
+  async function sendOne(){
+    const baseUrl = $("baseUrl").value.trim().replace(/\/+$/,"");
+    const apiKey  = $("apiKey").value.trim();
+    if (!apiKey){ log("warn","","missing API key"); return; }
+    const model = $("model").value.trim() || "luv13-glm-5.2-fast";
+
+    sent += 1; stats();
+    const startedAt = performance.now();
+
+    try{
+      const resp = await fetch(`${baseUrl}/chat/completions`, {
+        method:"POST",
+        headers:{ "Authorization":`Bearer ${apiKey}`, "Content-Type":"application/json" },
+        body: JSON.stringify({
+          model,
+          messages:[{role:"user",content:"hi"}],
+          max_tokens: 5,
+          stream:false,
+        }),
+      });
+
+      const account = resp.headers.get("X-Served-Account") || null;
+
+      if (resp.ok){
+        served += 1; stats();
+        if (account) touch(account);
+        const ms = Math.round(performance.now() - startedAt);
+        log("ok", account, `200 in ${ms}ms`);
+      } else {
+        errors += 1; stats();
+        const ra = resp.headers.get("Retry-After");
+        let detail = `${resp.status}`;
+        try{ const j = await resp.json(); detail = `${resp.status} ${j?.error?.message||""}`; }catch(_){}
+        // If we have an account from headers (pre-failover), treat as limited.
+        if (account) markLimited(account, ra);
+        log("err", account, `${detail}${ra?`  (Retry-After ${ra}s)`:""}`);
+      }
+    }catch(err){
+      errors += 1; stats();
+      log("err","","network: "+(err?.message||err));
+    }
+  }
+
+  // ── Burst loop ───────────────────────────────────────────────────
+  let burstTimer = null, burstInflight = 0;
+  function startBurst(){
+    const rps = Math.max(1, parseInt($("rate").value||"6",10));
+    const interval = 1000 / rps;
+    $("burstBtn").disabled = true;
+    $("stopBtn").disabled = false;
+    log("warn","","burst started  ("+rps+" req/s)");
+    burstTimer = setInterval(()=> sendOne(), interval);
+  }
+  function stopBurst(){
+    if (burstTimer){ clearInterval(burstTimer); burstTimer=null; }
+    $("burstBtn").disabled = false;
+    $("stopBtn").disabled = true;
+    log("ok","","burst stopped");
+  }
+
+  // ── Wire up ──────────────────────────────────────────────────────
+  $("send1").addEventListener("click", sendOne);
+  $("burstBtn").addEventListener("click", startBurst);
+  $("stopBtn").addEventListener("click", stopBurst);
+  // Enter key in API key sends one
+  $("apiKey").addEventListener("keydown", e=>{ if (e.key==="Enter") sendOne(); });
+</script>
+</body>
+</html>
